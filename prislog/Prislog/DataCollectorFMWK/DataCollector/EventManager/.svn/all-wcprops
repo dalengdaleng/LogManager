@@ -1,0 +1,53 @@
+K 25
+svn:wc:ra_dav:version-url
+V 138
+/svn/mag_pris_mobile/!svn/ver/60371/trunk/code/iOS/IPAD_ProtocolOptimize/DataEngine/Framework/DataCollectorFMWK/DataCollector/EventManager
+END
+DCUtil.m
+K 25
+svn:wc:ra_dav:version-url
+V 147
+/svn/mag_pris_mobile/!svn/ver/44020/trunk/code/iOS/IPAD_ProtocolOptimize/DataEngine/Framework/DataCollectorFMWK/DataCollector/EventManager/DCUtil.m
+END
+EventManager.h
+K 25
+svn:wc:ra_dav:version-url
+V 153
+/svn/mag_pris_mobile/!svn/ver/44020/trunk/code/iOS/IPAD_ProtocolOptimize/DataEngine/Framework/DataCollectorFMWK/DataCollector/EventManager/EventManager.h
+END
+SystemMonitor.h
+K 25
+svn:wc:ra_dav:version-url
+V 154
+/svn/mag_pris_mobile/!svn/ver/44020/trunk/code/iOS/IPAD_ProtocolOptimize/DataEngine/Framework/DataCollectorFMWK/DataCollector/EventManager/SystemMonitor.h
+END
+Event.h
+K 25
+svn:wc:ra_dav:version-url
+V 146
+/svn/mag_pris_mobile/!svn/ver/56285/trunk/code/iOS/IPAD_ProtocolOptimize/DataEngine/Framework/DataCollectorFMWK/DataCollector/EventManager/Event.h
+END
+SystemMonitor.m
+K 25
+svn:wc:ra_dav:version-url
+V 154
+/svn/mag_pris_mobile/!svn/ver/44020/trunk/code/iOS/IPAD_ProtocolOptimize/DataEngine/Framework/DataCollectorFMWK/DataCollector/EventManager/SystemMonitor.m
+END
+EventManager.m
+K 25
+svn:wc:ra_dav:version-url
+V 153
+/svn/mag_pris_mobile/!svn/ver/60371/trunk/code/iOS/IPAD_ProtocolOptimize/DataEngine/Framework/DataCollectorFMWK/DataCollector/EventManager/EventManager.m
+END
+DCUtil.h
+K 25
+svn:wc:ra_dav:version-url
+V 147
+/svn/mag_pris_mobile/!svn/ver/44020/trunk/code/iOS/IPAD_ProtocolOptimize/DataEngine/Framework/DataCollectorFMWK/DataCollector/EventManager/DCUtil.h
+END
+Event.m
+K 25
+svn:wc:ra_dav:version-url
+V 146
+/svn/mag_pris_mobile/!svn/ver/44020/trunk/code/iOS/IPAD_ProtocolOptimize/DataEngine/Framework/DataCollectorFMWK/DataCollector/EventManager/Event.m
+END

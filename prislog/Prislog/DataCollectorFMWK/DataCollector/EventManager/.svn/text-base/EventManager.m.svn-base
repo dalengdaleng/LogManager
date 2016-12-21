@@ -1,0 +1,899 @@
+//
+//  EventManager.m
+//  Collector
+//
+//  Created by ; on 11-11-3.
+//  Copyright (c) 2011年 __MyCompanyName__. All rights reserved.
+//
+
+#import "EventManager.h"
+#import "UrlManager.h"
+#import "DeviceInfo.h"
+/*
+ * 网络类型
+ */
+#define NETWORK_NotReachable @"NotReachable"
+#define NETWORK_ReachableViaWifi @"ReachableViaWiFi"
+#define NETWORK_ReachableViaWWAN @"ReachableViaWWAN"
+
+NSFileManager *gFileManager = nil;
+
+static EventManager *sharedEventManager = nil;
+static NSThread *handlerThread = nil;
+int gAdd_Debug_Header = 0;
+
+@implementation EventManager
+/*------------------------------------------------------*
+ | 事件从添加到发送的过程:
+ |    --(addEvent:)-->              [events]
+ |    --(compose Events ToJson:)-->   [jsonCombineString]
+ |    --(composeDataForSend:)-->    [dataToPost]
+ |    --(postNewMessage:)-->        发送
+ *------------------------------------------------------*/
+#pragma mark - event message operation
+/*
+ * add a common message header
+ */
+-(void) addHeader:(NSString *) key value:(NSString *) value
+{
+    [self.msgHeader setValue:value forKey:key];
+}
+/*
+ * add a new event data into event array
+ */
+-(void)addEvent:(Event *) event
+{
+    [event setEventAccount:self.currAccount];
+    [event setEventUserId:self.currUserId];
+    [event setEventStatus:toSend];
+    [self.events addObject:event];
+    DCPrint(@"add event, name: %@ ,total count:%d", event.eventName,self.events.count);
+    
+    // 计算当前记录的events大小是否 >30k && <31k，如果是，则转成一个json
+    NSUInteger length = [self currentEventsLength];
+    
+    // 当目前已记录的event长度已经超过30k，，并且不能超过31k。进行分割
+    if (length > JSON_STR_LENGTH && length < (JSON_STR_LENGTH + 1 * 1024)) {
+        // 如果不是第一个json，则添加分割字符
+        [self transformEventsToJson];
+        DCPrint(@"events > 30k, convert to json");
+    }
+}
+
+- (void)transformEventsToJson
+{
+    if ([_jsonCombineString length] != 0) {
+        [_jsonCombineString appendString:SPLIT_TAG];
+    }
+    NSString *composeStr = [self composeEventsToJson];
+    //4.8.6 添加的保护
+    if ([composeStr length] > 0) {
+        [_jsonCombineString appendString:composeStr];
+    }
+}
+
+-(NSString *) composeEventsToJson
+{
+    /* 1. 构造公共信息部分
+     * 2. 组装公共信息和event信息
+     * 3. NSDictionary 转换成 JSON格式的字符串
+     */
+    
+    NSMutableDictionary *msgDicts = [NSMutableDictionary dictionary];
+    
+    //1
+    [self builtMessageHeader];
+    [msgDicts setValuesForKeysWithDictionary:_msgHeader];
+    
+    //2
+    NSMutableArray *dictArray = [NSMutableArray array];
+    for (int index = 0;index < [_events count]; index++) {
+        Event *event = [_events objectAtIndex:index];
+        [dictArray addObject:[event getEventDictionary]];
+    }
+    [msgDicts setValue:dictArray forKey:MSGBODY];
+    
+    //3
+    NSString *jsonString = [self JSONRepresentationCustomWithObject:msgDicts];
+    [_events removeAllObjects];// 从当前数组中删除已经转换程json的event
+    return jsonString;
+}
+
+/*
+ * 把所有的event改成Dictionary，用于转换成Json
+ */
+-(int) currentEventsLength
+{
+    NSMutableArray *messagesArray = [[[NSMutableArray alloc] init] autorelease];
+    
+    for (int index = 0;index < [_events count]; index++) {
+        Event *event = [_events objectAtIndex:index];
+        [messagesArray addObject:[event getEventDictionary]];
+    }
+    NSDictionary *dicts = [NSDictionary dictionaryWithObject: messagesArray forKey:MSGBODY];
+    NSString *string = [self JSONRepresentationCustomWithObject:dicts];
+    
+    return [[string dataUsingEncoding:NSUTF8StringEncoding] length];
+}
+
+/*
+ * method to built all the header values
+ */
+-(void) builtMessageHeader
+{
+    [self.msgHeader setValuesForKeysWithDictionary:[self returnMessageHeader]];
+    
+    // add first account name
+    if ([self.events count] == 0)
+    {
+        DCPrint(@"本次发送events array为空!!??",nil);
+    }else{
+        // 如果account info in the first account 等于空或者nil，不添加该字段
+        if ([[self.events objectAtIndex:0] eventAccount] != nil && [[[self.events objectAtIndex:0] eventAccount] compare:@""] != NSOrderedSame)
+        {
+            [self.msgHeader setValue:[[self.events objectAtIndex:0] eventAccount] forKey:MSGHEADER_FIRSTEVENTACCOUNT];
+            [self.msgHeader setValue:[[self.events objectAtIndex:0] eventUserId] forKey:MSGHEADER_FIRSTUSERID];
+        }
+    }
+}
+
+- (NSMutableDictionary *)returnMessageHeader
+{
+    NSMutableDictionary *mDict = [NSMutableDictionary dictionaryWithDictionary:self.msgHeader];
+    UIDevice* device = [UIDevice currentDevice];
+    UIScreen *scr = [UIScreen mainScreen] ;
+    
+    /*
+     * 产品名(登陆时记录)
+     * 产品版本号(登陆时记录)
+     * 渠道商(可选)
+     */
+    [mDict setValue:[NSNumber numberWithInt:gAdd_Debug_Header] forKey:MSGHEADER_DEBUG]; //测试的统计数据
+    [mDict setValue:ProtocolVersion forKey:MSGHEADER_PROTOCOL_VER];// 统计协议版本号
+    [mDict setValue:[device model] forKey:MSGHEADER_TERMINAL_TYPE];// 移动终端型号
+    [mDict setValue:[device model] forKey:MSGHEADER_TERMINAL_VER];// 移动终端版本
+    [mDict setValue:@"" forKey:MSGHEADER_TERMINAL_UID];// 移动终端设备编号
+    
+    // 如果已经设置过mac地址，则不再设置
+    if ([mDict objectForKey:MSGHEADER_MAC] == nil
+        || [[mDict objectForKey:MSGHEADER_MAC] isEqualToString:@""])
+    {
+        [mDict setValue:[DCUtil macAddress] forKey:MSGHEADER_MAC];
+    }
+    
+    if (![mDict objectForKey:MSGHEADER_OS]) {
+        [mDict setValue:[device systemName] forKey:MSGHEADER_OS];// 操作系统
+    }
+    static unsigned long long memSize = 0;
+    if (memSize == 0)
+    {
+        memSize = [[NSProcessInfo processInfo] physicalMemory]/1000;
+    }
+    [mDict setValue:[NSNumber numberWithUnsignedLongLong:memSize] forKey:MSGHEADER_MEMORY];
+    [mDict setValue:[device systemVersion] forKey:MSGHEADER_OS_VER];// 操作系统版本号
+    
+    int ppi = [DeviceInfo getDevicePPI];//ppi
+    [mDict setValue:[NSNumber numberWithInt:ppi] forKey:MSGHEADER_PPI];
+    NSString *deviceType = [DeviceInfo getDeviceName];
+    if (deviceType)
+        [mDict setValue:deviceType forKey:MSGHEADER_DEV_TYPE];
+    NSString *resolution = [NSString stringWithFormat:@"%d*%d",
+                            (int)(scr.bounds.size.height*scr.scale),
+                            (int)(scr.bounds.size.width*scr.scale)];
+    [mDict setValue:resolution forKey:MSGHEADER_SCREEN_SIZE];  // 分辨率
+    // 上报时间
+    [mDict setValue:[NSNumber numberWithLongLong:[DCUtil timeToMillionSecond:[NSDate date]]] forKey:MSGHEADER_REPORT_TIME];
+    return mDict;
+}
+
+/*
+ * 组装待发送的数据, 把多个jsonString组合起
+ */ 
+-(NSData *) composeDataForSend
+{
+    [self transformEventsToJson];
+    DCPrint(@"待发送字符串\n%@", self.jsonCombineString);
+    DCPrintDebug(@"待发送字符串\n%@", self.jsonCombineString);
+    
+    self.dataToPost = [DCUtil encryptMessage:[DCUtil compressData:[_jsonCombineString dataUsingEncoding:NSUTF8StringEncoding]]];
+    return _dataToPost;
+}
+
+-(void) storeSendDataToFile
+{
+    [DCUtil writeFile:_dataToPost];
+}
+
+#pragma mark - post instant event
+// 立即发送的事件，记录并发送
+- (void)sendInstantEvent:(Event *)event
+{
+    [event setEventAccount:self.currAccount];
+    [event setEventUserId:self.currUserId];
+    [event setEventStatus:toSend];
+    
+    // 1 从存储的文件读取
+    NSString *storedString = [self readStoredInstantEventString];
+    // 这里为了兼容多用户分不同的json字串，解析出来的是以用户为key的dictionary
+    NSMutableDictionary *userEventDict = [storedString JSONFragmentValue];
+    if (userEventDict == nil) {
+        userEventDict = [NSMutableDictionary dictionary];
+    }
+    
+    // 2 加入数据队列
+    NSMutableDictionary *msgDicts = [NSMutableDictionary dictionary];
+    
+    NSMutableArray *eventArray = nil;
+    if (event)
+    {
+        eventArray = [NSMutableArray arrayWithObject:[event getEventDictionary]];
+    }else
+    {
+        eventArray = [NSMutableArray array]; // 是定位后的重新发送，这时候上次调用时带进的event数据已经存入文件 instfile
+    }
+    NSDictionary *eventDict = [userEventDict objectForKey:self.currAccount];
+    if (eventDict!=nil) {
+//        [userEventDict removeObjectForKey:self.currAccount];
+        [msgDicts addEntriesFromDictionary:eventDict];
+        [eventArray addObjectsFromArray:[msgDicts objectForKey:MSGBODY]];
+    }else{
+        [msgDicts setValuesForKeysWithDictionary:[self returnMessageHeader]];
+        [msgDicts setValue:[NSNumber numberWithInt:1] forKey:MSGHEADER_ISREALTIME];
+        [msgDicts setValue:self.currAccount forKey:MSGHEADER_FIRSTEVENTACCOUNT];
+        [msgDicts setValue:self.currUserId forKey:MSGHEADER_FIRSTUSERID];
+    }
+    [msgDicts setValue:eventArray forKey:MSGBODY];
+    [userEventDict setValue:msgDicts forKey:self.currAccount];
+    
+    [_lastSendInstantDataInJson release];
+    _lastSendInstantDataInJson = [[self JSONRepresentationCustomWithObject:userEventDict] retain];
+
+    // 3 组成发送数据
+    NSMutableString *jsonStringForSend = [NSMutableString string];
+    BOOL isFirstDict = YES;
+    for (NSDictionary *aMsg in userEventDict.allValues)
+    {
+        if (isFirstDict == NO) {
+            [jsonStringForSend appendString:SPLIT_TAG];
+        }
+        NSString *str = [self JSONRepresentationCustomWithObject:aMsg];
+        if (str) {
+            [jsonStringForSend appendString:str];
+        }
+        isFirstDict  = NO;
+    }
+    
+    DCPrint(@"send instant event: %@",jsonStringForSend);
+    
+    NSData *data = [DCUtil encryptMessage:[DCUtil compressData:[jsonStringForSend dataUsingEncoding:NSUTF8StringEncoding]]];
+    
+    _isSendInstantEvent = YES;
+    if ([_serverUrl isEqualToString:@""] || _serverUrl == nil) {
+        [self writeToInstFile]; // 先保存至文件，回头重新发送
+        if (![self postLocateMessage]) {
+            DCPrint(@"locate message fail while send Instant");
+        }
+    }else if (![self sendMessage:data]) {
+        [self onSendInstantEventRet:-1]; // 失败
+    }
+}
+
+- (void)writeToInstFile
+{
+    NSFileManager *fileManager = [EventManager getFileManager];
+    NSString *dstDir = [NSHomeDirectory() stringByAppendingString:RELATIVE_DIR];
+    NSString *dstFilePath = [dstDir stringByAppendingString:[NSString stringWithFormat:@"instfile"]];
+    
+    if(![fileManager fileExistsAtPath:dstDir]){
+        [fileManager createDirectoryAtPath:dstDir withIntermediateDirectories:YES attributes:nil error:nil];
+    }
+    
+    NSData *data = [DCUtil encryptMessage:[DCUtil compressData:[_lastSendInstantDataInJson dataUsingEncoding:NSUTF8StringEncoding]]];
+    if (![fileManager createFileAtPath:dstFilePath contents:data attributes:nil]) {
+        DCPrint(@"失败.....");
+    }
+}
+/**
+ *  @param code ,0 成功，非0 失败
+ *
+ */
+- (void)onSendInstantEventRet:(int)code
+{
+    _isSendInstantEvent = NO;
+
+    if (code != 0 ) {
+        // 存数据
+        [self writeToInstFile];
+    }else{
+        // 清数据，删文件
+        [_lastSendInstantDataInJson release];
+        _lastSendInstantDataInJson = nil;
+        NSFileManager *fileManager = [EventManager getFileManager];
+        NSString *dstDir = [NSHomeDirectory() stringByAppendingString:RELATIVE_DIR];
+        NSString *dstFilePath = [dstDir stringByAppendingString:[NSString stringWithFormat:@"instfile"]];
+        NSError *error = nil;
+        DCPrint(@"send instant event Success.")
+        if ([fileManager fileExistsAtPath:dstFilePath]) {
+            if (![fileManager removeItemAtPath:dstFilePath error:&error]) {
+                NSLog(@"remove file error: %@",error);
+            }
+        }
+    }
+}
+
+- (NSString *)readStoredInstantEventString
+{
+    NSFileManager *fileManager = [EventManager getFileManager];
+    
+    // variable that represents the directory and name
+    NSString *dstDir = [NSHomeDirectory() stringByAppendingString:RELATIVE_DIR];
+    
+    if(![fileManager fileExistsAtPath:dstDir]){
+        return nil;
+    }
+    
+    NSString *dstFilePath = [dstDir stringByAppendingString:[NSString stringWithFormat:@"instfile"]];
+    NSData *data = [NSData dataWithContentsOfFile:dstFilePath];
+    NSData *plain = [DCUtil decryptMessage:data];
+    NSString *str = [[NSString alloc] initWithData:plain encoding:NSUTF8StringEncoding];
+    return [str autorelease];
+}
+
+#pragma mark - post message actions
+/*
+ * method used by interface layer to send message
+ * 
+ * post old message stored in file, if exist, then post the new message
+ */
+-(BOOL) postMessageWithEventType:(SendActionType) type
+{
+    NSArray *arr = [NSArray arrayWithObjects:@"AppSwitchBackSend",@"AppTerminateSend",@"AppSwitchFrontSend",
+                    @"AppLaunchSend",@"ImmediateSend",@"HeartBeatSend", @"PendingResend", nil];
+    NSString *actionType = [arr objectAtIndex:type];
+    DCPrint(@"post action type: %@", actionType);
+   
+    self.eventType = type;
+    
+    // 不允许发送，则直接返回，如果有后台任务则关闭
+    if (self.moduleStatus != MS_LogAndSend ) {
+        if (type == AppSwitchBackSend) { // 关闭bg task
+            [[NSNotificationCenter defaultCenter] postNotificationName:@"EventMangerPostNewMessageFinish" object:self];
+        }
+        return NO;
+    }
+    
+    // 如果是程序关闭时的发送，则立即保存成文件
+    if (type == AppTerminateSend) {
+        [self composeDataForSend];
+        [self storeSendDataToFile];
+    }
+    
+    // 检查是否已经知道统计服务器的地址和服务器开关命令
+    if ([_serverUrl isEqualToString:@""] || _serverUrl == nil) {
+        
+        if (type != PendingResend) {// 防止locate请求失败后，无线循环
+            _sendPending = YES;
+        }
+        
+        if (type == AppSwitchBackSend) {
+            _isSwitchBackPending = YES;
+        }
+        
+        if (![self postLocateMessage]) {
+            // 发送失败，重置阻塞标记
+            _sendPending = NO;
+            return NO;
+        }
+        return YES;     
+    }
+    
+    // 如果上一个发送未完成，则标记阻塞
+    if ([ServerConnection getServerConnection].isSending) 
+    {
+        DCPrint(@"发送请求被阻塞: %@",actionType);
+        if (type == AppSwitchBackSend) {
+            // 该标记用于判断在收到响应后，需要关掉后台任务(因为切后台事件被阻塞, 后台任务已启动)
+            _isSwitchBackPending = YES;
+        }
+        _sendPending = YES;
+        return NO;
+    }
+    
+    // 在启动，和切到前台时候也需要检查是否有旧文件需要发送。所以此处不判断action type
+    if ([self isAnyOldMessages]) {
+        _isSendingOldFile = YES;
+        [self postOldMessage];
+        return YES;
+    }
+    
+    _isSendingOldFile = NO;
+    // app lauch 和 app switch front，这两个时机只发送旧文件
+    if (_eventType != AppLaunchSend && _eventType != AppSwitchFrontSend )
+    {
+        return [self postNewMessage];
+    }
+    
+    return YES;
+}
+
+/*
+ * send the event produced  during this session(from enter foreground to enter background)
+ */
+-(BOOL) postNewMessage
+{
+    [self composeDataForSend];
+    self.jsonCombineString = [NSMutableString string];
+    
+    if (![self sendMessage:_dataToPost]) {
+        [self connectionPostMessageFail:nil];
+        return NO;
+    }
+    return YES;
+}
+
+/*
+ * methods used to send old data which are stored in file
+ */
+-(void) postOldMessage
+{
+    // variables initialization
+    NSFileManager *fileManager = [EventManager getFileManager];
+    NSString *homeDir = NSHomeDirectory();    // get application root directory
+    NSString *dstDir = [homeDir stringByAppendingString:RELATIVE_DIR];    // represents the directory and name
+    NSArray *oldFileArray = [fileManager contentsOfDirectoryAtPath:dstDir error:nil];
+    NSString *fileFullPath;
+    NSData *fileContentData;
+    NSError *error;
+    
+    // 1. 删除上次删除的旧文件
+    if ([self lastSendOldFilePath]!= nil) {
+        if ([[EventManager getFileManager] removeItemAtPath:[self lastSendOldFilePath] error:&error]) 
+        {
+            DCPrint(@"删除已发送的旧消息文件：%@",self.lastSendOldFilePath);
+        }else{
+            DCPrint(@"删除已发送文件发生错误: %@ ",error);
+        }
+        
+    }   
+    
+    // 2. 是否还有旧消息文件
+    if (![self isAnyOldMessages]) {
+        _isSendingOldFile = NO;
+        if (_eventType != AppLaunchSend && _eventType != AppSwitchFrontSend )
+        {   // all old files have been proccessed successfully, post new message
+            [self postNewMessage];
+        }
+        return;
+    }
+    
+    // 3. send data in file, and delete if file is empty
+    for (int index = 0; index < [oldFileArray count]; index ++)
+    {   // file Full Path
+        fileFullPath = [dstDir stringByAppendingFormat:@"%@",[oldFileArray objectAtIndex:index]];
+        fileContentData = [NSData dataWithContentsOfFile:fileFullPath];
+        
+        // 文件不为空， 发送数据
+        if(fileContentData.length != 0){
+            // send data
+            _isSendingOldFile = YES;
+            if(![self sendMessage: fileContentData])// error ocurred, before sending
+            {
+                DCPrint(@"error ocurred, before sending! ", nil);
+                [self connectionPostMessageFail:nil];   
+            }
+            self.lastSendOldFilePath = fileFullPath;
+            DCPrint(@"发送oldMessage文件: %@ ",fileFullPath);
+            return;
+        }else{
+            NSString *printStr = [NSString stringWithFormat:@"删除空的文件：%@ ",self.lastSendOldFilePath];
+            // remove empty file
+            if (![[EventManager getFileManager] removeItemAtPath:fileFullPath error:&error]) {
+                [printStr stringByAppendingFormat:@" 失败，error:%@",error];
+            } ;
+            DCPrint(printStr);
+        }
+    }
+    return;
+}
+
+/*
+ * find old files
+ * if no file, return NO, else YES
+ */
+-(BOOL) isAnyOldMessages{
+    // variables 
+    NSFileManager *fileManager = [EventManager getFileManager];
+    NSString *homeDir = NSHomeDirectory();    // get application root directory
+    NSString *dstDir = [homeDir stringByAppendingString:RELATIVE_DIR];    // represents the directory and name
+    NSArray *oldFileArray = [fileManager contentsOfDirectoryAtPath:dstDir error:nil];
+    
+    return [oldFileArray count] > 0 ? YES: NO;
+}
+
+-(BOOL) postLocateMessage
+{
+    DCPrint(@"post locate request");
+    // 1.built message headers
+    [self builtMessageHeader];
+    
+    NSMutableDictionary *dicts = [NSMutableDictionary dictionary];
+    
+    [dicts setValuesForKeysWithDictionary:self.msgHeader];
+    
+    // transform data from dictionary to json
+    NSString *jsonString = [self JSONRepresentationCustomWithObject:dicts];
+    
+    // 2. do compress and encryption
+    self.dataToPost = [DCUtil encryptMessage:[DCUtil compressData:[jsonString dataUsingEncoding:NSUTF8StringEncoding]]];
+    
+#ifdef DATAENGINE_LOG_TO_CONSOLE
+    NSURLConnection *urlConnection;
+    NSMutableURLRequest *serverRequest = [NSMutableURLRequest requestWithURL:[NSURL URLWithString:@"http://www.163.com"] cachePolicy:NSURLCacheStorageNotAllowed timeoutInterval:10];
+    [serverRequest setHTTPMethod: @"POST"];
+    NSData *sendData = [DCUtil uncomressData:[DCUtil decryptMessage:_dataToPost]];
+    NSLog(@"%@", [[[NSString alloc]initWithData:sendData encoding:NSUTF8StringEncoding]autorelease]);
+    [serverRequest setHTTPBody:sendData];
+    urlConnection = [[NSURLConnection alloc]initWithRequest:serverRequest delegate:self];
+    [urlConnection release];
+    
+#endif
+    
+    if (![[ServerConnection getServerConnection] sendData:_dataToPost withUrl:MAIN_SERVER_URL]) {
+        [self connectionPostMessageFail:nil];
+        return NO;
+    }
+    
+    return YES;
+}
+
+#pragma mark - connection
+
+/*
+ * send the data by server connection
+ */
+-(BOOL) sendMessage:(NSData *)data
+{
+    // 2013.3.15 comment: 设备修改DNS，导致误判网络不可达
+    /**
+    _networkType = [[DCReachability reachabilityWithHostName:MAIN_SERVER_URL] currentReachabilityStatus];
+    if (_networkType == DCNotReachable) 
+    {
+        DCPrint(@"Reaschability: NotReachable!", nil);
+        return NO;
+    }
+     **/
+    
+#ifdef DATAENGINE_LOG_TO_CONSOLE
+    NSURLConnection *urlConnection;
+    NSMutableURLRequest *serverRequest = [NSMutableURLRequest requestWithURL:[NSURL URLWithString:@"http://www.163.com"] cachePolicy:NSURLCacheStorageNotAllowed timeoutInterval:10];
+    [serverRequest setHTTPMethod: @"POST"];
+    NSData *sendData = [DCUtil uncomressData:[DCUtil decryptMessage:_dataToPost]];
+    NSLog(@"%@", [[[NSString alloc]initWithData:sendData encoding:NSUTF8StringEncoding]autorelease]);
+    [serverRequest setHTTPBody:sendData];
+    urlConnection = [[NSURLConnection alloc]initWithRequest:serverRequest delegate:self];
+    [urlConnection release];
+    
+#endif
+    
+    return [[ServerConnection getServerConnection] sendData:data withUrl:_serverUrl];
+}
+
+/*
+ * ServerConnection return Success
+ * 1. 判断是否为locate request的返回
+ */
+-(void)connectionPostMessageSuccess:(NSURLConnection *) connection
+{
+    if ([[ServerConnection getServerConnection].serverRequest.URL.absoluteString isEqualToString:MAIN_SERVER_URL]) {
+        [self parseLocateResult:[[ServerConnection getServerConnection] receivedData]];
+        // 执行重发
+        _sendPending = NO;
+        if (_isSendInstantEvent) {
+            [self sendInstantEvent:nil];
+            return;
+        }
+        [self postMessageWithEventType:PendingResend];
+        return;
+    }
+    
+    DCPrint(@"post message success");
+    if (_isSendInstantEvent) {
+        DCPrint(@"--it's a instant event sent");
+        [self onSendInstantEventRet:0];
+        return;
+    }
+    
+    [self setLastMessageSendTime:[NSDate date]];// 保存上次发送数据成功的时间，用于判断是否需要发送心跳事件
+    
+    // 如果是发送旧文件数据的返回，则继续发送旧文件, 
+    if (_isSendingOldFile) 
+    {
+        [self postOldMessage];//在postOldMessage中会判断旧文件是否已经发送完毕
+        return;
+    }
+    
+    // 有被阻塞的发送，则再发送一次
+    if (_sendPending){
+        _sendPending = NO;
+        [self postNewMessage];
+        return;
+    }
+    
+    // 切换到后台的发送 被阻塞发送的情况，此时发送的eventType未被更改，所以需要使用_isSwitchBackPending来判断
+    if (_isSwitchBackPending == YES) 
+    {
+        _isSwitchBackPending = NO;
+        [[NSNotificationCenter defaultCenter] postNotificationName:@"EventMangerPostNewMessageFinish" object:self];
+        return;
+    }
+    
+    // 切换到后台的发送 未被阻塞的情况
+    if (_eventType == AppSwitchBackSend)
+    {
+        [[NSNotificationCenter defaultCenter] postNotificationName:@"EventMangerPostNewMessageFinish" object:self];
+    }
+    return;
+}
+
+/*
+ * ServerConnection return Fail
+ */
+-(void)connectionPostMessageFail:(NSURLConnection *) connection
+{ 
+    BOOL isLocateRequest = [[ServerConnection getServerConnection].serverRequest.URL.absoluteString isEqualToString:MAIN_SERVER_URL];
+    NSString *err = isLocateRequest?@"locate request fail":@"post message fail";
+    DCPrint(err);
+    
+    if (_isSendInstantEvent) {
+        [self onSendInstantEventRet:-1];
+        return;
+    }
+    
+    // 防止被删除（因为发送失败，所以不需要删除）
+    if (_isSendingOldFile) {
+        self.lastSendOldFilePath = nil;
+    }
+    
+    // 有被阻塞的发送，则再发送一次
+    if (_sendPending){
+        _sendPending = NO;
+        [self postMessageWithEventType:PendingResend];
+        return;
+    }
+    
+    // 发送旧消息文件失败或者是app terminate引起的发送（此情况在发送前已保存数据），则不需要写文件
+    // 其他情况的发送失败需要写文件（立即发送、切换到后台的发送）
+    if (!_isSendingOldFile && _eventType != AppTerminateSend && !isLocateRequest){
+        [self storeSendDataToFile];
+    }
+    
+    // 切换到后台事件被阻塞发送的情况，此时发送的eventType被最新的发送事件重赋值，所以需要使用_isSwitchBackPending来判断
+    if (_isSwitchBackPending == YES) {
+        _isSwitchBackPending = NO;
+        [[NSNotificationCenter defaultCenter] postNotificationName:@"EventMangerPostNewMessageFinish" object:self];
+        return;
+    }
+    
+    // 切换到后台未被阻塞的情况
+    if (_eventType == AppSwitchBackSend){
+        [[NSNotificationCenter defaultCenter] postNotificationName:@"EventMangerPostNewMessageFinish" object:self];
+    }
+    return;
+}
+
+#pragma mark - JSON parser and builder (transplanted from "NSObject+SBJson.m", due to category doesn't work in static library)
+
+-(void) parseLocateResult:(NSData *)data
+{
+    NSDictionary * dicts = [self JSONValueWithString:[[[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding] autorelease]];
+    NSString *code = [dicts objectForKey:LOCATE_RESP_HEADER_CODE];
+    
+    
+    if ([code intValue] == 200)
+    {   // 200, 服务器允许收集数据
+        DCPrint(@"统计服务器开关 code 200,允许发送");
+        
+        NSMutableString *logserverUrl = [NSMutableString stringWithFormat:@"http://%@%@", [dicts objectForKey:LOCATE_RESP_HEADER_LOGSERVER], SERVER_PATH] ;
+        self.serverUrl = logserverUrl;
+        
+        // 根据用户的设置，设定模块开关
+        if ( self.moduleStatus != MS_NoLogNoSend )
+        {
+            self.moduleStatus = MS_LogAndSend;            
+        }else{
+            // 用户关闭，服务器允许的情况，最终还是不允许
+            self.moduleStatus = MS_NoLogNoSend;
+        }
+        
+    }else if ([code intValue] == 403){
+        DCPrint(@"统计服务器开关 code 403, 不 允许发送");
+        // 403,服务器不允许收集数据
+        self.moduleStatus = MS_NoLogNoSend;
+    }else{
+        DCPrint(@"错误的统计服务器code, code:%d", code.intValue);
+    }
+    return;
+}
+
+/*
+ * method convert data to json string
+ */
+- (NSString *)JSONRepresentationCustomWithObject:(NSObject *) obj 
+{
+    SBJsonWriter *writer = [[[SBJsonWriter alloc] init] autorelease];    
+    NSString *json = [writer stringWithObject:obj];
+    if (!json){
+//        DCPrint(@"-JSONRepresentation failed. Error is: %@", writer.error);            
+    }
+    return json;
+}
+
+- (id)JSONValueWithString:(NSString *) string
+{
+    SBJsonParser *parser = [[[SBJsonParser alloc] init] autorelease];
+    id repr = [parser objectWithString:string];
+    if (!repr){
+//        DCPrint(@"-JSONValue failed. Error is: %@", parser.error);
+    }
+    return repr;
+}
+
+#pragma mark - overrided methods 
+/*
+ * return network type: wifi, WWAN
+ */
+-(NSString *) getNetworkType
+{	
+    NSArray *arr = [NSArray arrayWithObjects:NETWORK_NotReachable,NETWORK_ReachableViaWifi,NETWORK_ReachableViaWWAN, nil];
+    
+    if (_networkType == 0)// retest once
+    {
+        _networkType = [[DCReachability reachabilityWithHostName:MAIN_SERVER_URL] currentReachabilityStatus];
+    }
+    
+    return _networkType==0?nil:[arr objectAtIndex:_networkType];
+}
+
+/*
+ *  condition check before module t
+ * 1. Module Switch key check
+ */
+- (BOOL)isNeedSend
+{
+    return self.moduleStatus == MS_LogAndSend;
+}
+
+- (BOOL)isNeedLog
+{
+    // 1.是否记录的条件检查
+    if (self.moduleStatus == MS_NoLogNoSend) {
+        return NO;
+    }else{
+        return YES;
+    }
+}
+
+#pragma mark - event manager running thread
++ (NSThread *)threadForOperation
+{
+	if (handlerThread == nil){
+		@synchronized(self) {
+			if (handlerThread == nil) {
+				handlerThread = [[NSThread alloc] initWithTarget:self selector:@selector(runHandler) object:nil];
+				[handlerThread start];
+			}
+		}
+	}
+	return handlerThread;
+}
+
++ (void)runHandler
+{
+    // Should keep the runloop from exiting
+	CFRunLoopSourceContext context = {0, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL};
+	CFRunLoopSourceRef source = CFRunLoopSourceCreate(kCFAllocatorDefault, 0, &context);
+	CFRunLoopAddSource(CFRunLoopGetCurrent(), source, kCFRunLoopDefaultMode);
+    
+    BOOL runAlways = YES; // Introduced to cheat Static Analyzer
+	while (runAlways) {
+		NSAutoreleasePool *pool = [[NSAutoreleasePool alloc] init];
+		CFRunLoopRun();
+		[pool drain];
+	}
+    
+	// Should never be called, but anyway
+	CFRunLoopRemoveSource(CFRunLoopGetCurrent(), source, kCFRunLoopDefaultMode);
+	CFRelease(source);
+}
+#pragma mark - singleton methods
+
++ (NSFileManager *)getFileManager
+{
+    if (gFileManager == nil) {
+        gFileManager = [[NSFileManager alloc] init];
+    }
+    return gFileManager;
+}
+/*
+ * return the singel instance
+ */
++(id)instance
+{
+    if (sharedEventManager == nil) {
+        @synchronized(self) {
+            if (sharedEventManager == nil) {
+                sharedEventManager = [[EventManager alloc] init];
+            }
+        }
+    }
+    return sharedEventManager;
+}
+
+-(id) init
+{
+    if(!(self = [super init]))
+    {
+        return nil;
+    }
+    
+    // do variable initialization
+    self.events = [[[NSMutableArray alloc] init] autorelease];
+    self.msgHeader = [[[NSMutableDictionary alloc] init] autorelease];
+    self.lastMessageSendTime = [NSDate date];
+    self.currAccount = @"anonymous";
+    self.currUserId = @"0";
+    self.jsonCombineString = [[[NSMutableString alloc] init] autorelease];
+    
+    // set self as delegate of server connection
+    [[ServerConnection getServerConnection] setServerConnectionDelegate:self];
+    
+    _isSendingOldFile = NO;
+    _sendPending = NO;
+    _isSwitchBackPending = NO;
+    _networkType = DCNotReachable;
+    
+    // 读取保存的开关信息，设置开关
+    NSUserDefaults *userDefault = [NSUserDefaults standardUserDefaults];
+    NSNumber *userSwitchStatus = [userDefault valueForKey:USER_SWITCH_KEY];
+    if (userSwitchStatus != nil) {
+        int savedStatus = [userSwitchStatus intValue];
+        
+        if ( savedStatus >= 0 && savedStatus <= 2)
+        {
+            self.moduleStatus = savedStatus;
+        }
+        else{
+            DCPrint(@"userSwitchStatus,%@", userSwitchStatus);
+        }
+    }else{
+        // 默认关闭
+        self.moduleStatus = MS_NoLogNoSend;
+    }
+    return self;
+}
+
++(id)allocWithZone:(NSZone *)zone
+{
+    @synchronized(self) {
+        if (sharedEventManager == nil) {
+            sharedEventManager = [super allocWithZone:zone];
+            return sharedEventManager;  // assignment and return on first allocation
+        }
+    }
+    return nil; //on subsequent allocation attempts return nil
+}
+
+-(void)dealloc
+{
+    [_lastSendInstantDataInJson release];
+    [_currAccount release];
+    [_currUserId release];
+    [_msgHeader release];
+    [_events release];
+    [_dataToPost release];
+    [_lastMessageSendTime release];
+    [_lastSendOldFilePath release];
+    [_jsonCombineString release];
+    [super dealloc];
+}
+@end
